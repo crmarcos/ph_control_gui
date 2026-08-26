@@ -16,8 +16,18 @@ from PySide6.QtWidgets import (
 # CONFIGURACIÓN
 # =============================================================
 
-GET_INTERVAL = 2000       # GET cada 2 segundos
-RECONNECT_INTERVAL = 2000 # Reintento de conexión cada 2 segundos
+GET_INTERVAL = 2000
+RECONNECT_INTERVAL = 2000
+
+# Al abrir el puerto serie, Arduino puede reiniciarse.
+ARDUINO_BOOT_DELAY = 1200
+
+# Tiempo máximo esperando una respuesta ESTADO durante
+# la restauración.
+RESTORE_RESPONSE_TIMEOUT = 2000
+
+# Tiempo entre comandos de restauración.
+RESTORE_STEP_DELAY = 300
 
 
 # =============================================================
@@ -133,7 +143,27 @@ class MainWindow(QWidget):
         self.closing = False
 
         # -----------------------------------------------------
-        # ESTADO
+        # ESTADO CONFIRMADO POR ARDUINO
+        #
+        # None  = todavía desconocido
+        # True  = ON
+        # False = OFF
+        # -----------------------------------------------------
+
+        self.acido_state = None
+        self.base_state = None
+
+        # -----------------------------------------------------
+        # ESTADO DE RESTAURACIÓN
+        # -----------------------------------------------------
+
+        self.restoring = False
+
+        self.restore_steps = []
+        self.restore_index = 0
+
+        # -----------------------------------------------------
+        # LABEL DE ESTADO
         # -----------------------------------------------------
 
         self.status_label = QLabel(
@@ -193,7 +223,6 @@ class MainWindow(QWidget):
             self.btn3
         )
 
-        # Inicialmente deshabilitados
         self.set_buttons_enabled(False)
 
         # -----------------------------------------------------
@@ -217,18 +246,46 @@ class MainWindow(QWidget):
         )
 
         # -----------------------------------------------------
+        # TIMER ESPERA ARRANQUE ARDUINO
+        # -----------------------------------------------------
+
+        self.connect_timer = QTimer(self)
+
+        self.connect_timer.setSingleShot(True)
+
+        self.connect_timer.timeout.connect(
+            self.start_restore
+        )
+
+        # -----------------------------------------------------
+        # TIMER ENTRE PASOS DE RESTAURACIÓN
+        # -----------------------------------------------------
+
+        self.restore_timer = QTimer(self)
+
+        self.restore_timer.setSingleShot(True)
+
+        self.restore_timer.timeout.connect(
+            self.restore_next_step
+        )
+
+        # -----------------------------------------------------
+        # TIMEOUT ESPERANDO ESTADO
+        # -----------------------------------------------------
+
+        self.restore_timeout_timer = QTimer(self)
+
+        self.restore_timeout_timer.setSingleShot(True)
+
+        self.restore_timeout_timer.timeout.connect(
+            self.restore_timeout
+        )
+
+        # -----------------------------------------------------
         # PRIMERA CONEXIÓN
         # -----------------------------------------------------
 
         self.try_connect()
-
-        # -----------------------------------------------------
-        # CIERRE
-        # -----------------------------------------------------
-
-        self.setAttribute(
-            Qt.WA_DeleteOnClose
-        )
 
     # =========================================================
     # CONECTAR
@@ -239,8 +296,6 @@ class MainWindow(QWidget):
         if self.closing:
             return
 
-        # Si por alguna razón ya estamos conectados,
-        # no hacer nada.
         if self.connected:
             return
 
@@ -259,18 +314,17 @@ class MainWindow(QWidget):
             self.connected = True
 
             self.status_label.setText(
-                "CONECTADO - ESPERANDO ESTADO"
+                "CONECTADO - ESPERANDO"
             )
 
-            self.set_buttons_enabled(
-                True
-            )
+            # Durante la restauración los botones permanecen
+            # deshabilitados.
+            self.set_buttons_enabled(False)
 
-            # Detener timer de reconexión
             self.reconnect_timer.stop()
 
             # -------------------------------------------------
-            # Crear lector para esta conexión
+            # Crear lector serie
             # -------------------------------------------------
 
             self.reader = SerialReader(
@@ -287,19 +341,22 @@ class MainWindow(QWidget):
 
             self.reader.start()
 
-            # -------------------------------------------------
-            # Iniciar GET periódico
-            # -------------------------------------------------
-
-            self.get_timer.start(
-                GET_INTERVAL
-            )
-
-            # GET inmediato al conectar
-            self.send_get()
-
             print(
                 f"Conectado a {self.port}"
+            )
+
+            # -------------------------------------------------
+            # Arduino puede resetearse al abrir el COM.
+            # Esperamos antes de mandar comandos.
+            # -------------------------------------------------
+
+            print(
+                f"Esperando {ARDUINO_BOOT_DELAY} ms "
+                "para que Arduino termine de arrancar..."
+            )
+
+            self.connect_timer.start(
+                ARDUINO_BOOT_DELAY
             )
 
         except (
@@ -315,9 +372,7 @@ class MainWindow(QWidget):
             self.ser = None
             self.connected = False
 
-            self.set_buttons_enabled(
-                False
-            )
+            self.set_buttons_enabled(False)
 
             self.status_label.setText(
                 f"DESCONECTADO - "
@@ -380,28 +435,27 @@ class MainWindow(QWidget):
             f"{self.port}"
         )
 
-        # -----------------------------------------------------
-        # IMPORTANTE:
-        #
-        # Detenemos GET y cerramos completamente
-        # la conexión anterior.
-        # -----------------------------------------------------
+        # Cancelar cualquier restauración en curso.
+        self.cancel_restore()
 
         self.disconnect_serial()
 
-        # -----------------------------------------------------
-        # No queda ningún comando pendiente.
-        # Los botones quedan deshabilitados.
-        # -----------------------------------------------------
-
-        self.set_buttons_enabled(
-            False
-        )
+        self.set_buttons_enabled(False)
 
         self.status_label.setText(
             f"DESCONECTADO - "
             f"REINTENTANDO {self.port}"
         )
+
+        print()
+        print(
+            "Estado guardado para la próxima "
+            "reconexión:"
+        )
+
+        self.print_saved_state()
+
+        print()
 
         self.start_reconnect_timer()
 
@@ -418,6 +472,14 @@ class MainWindow(QWidget):
         # -----------------------------------------------------
 
         self.get_timer.stop()
+
+        # -----------------------------------------------------
+        # Detener timers de restauración
+        # -----------------------------------------------------
+
+        self.connect_timer.stop()
+        self.restore_timer.stop()
+        self.restore_timeout_timer.stop()
 
         # -----------------------------------------------------
         # Detener lector
@@ -457,22 +519,24 @@ class MainWindow(QWidget):
 
     def send_command(self, cmd):
 
-        # -----------------------------------------------------
-        # Nunca mandar comandos si estamos desconectados.
-        # -----------------------------------------------------
-
         if not self.connected:
-            return
+            return False
 
         if self.ser is None:
-            return
+            return False
 
         try:
 
-            # SerialCommand espera CR + LF
+            print(
+                f"TX: {cmd}"
+            )
+
+            # SerialCommand espera CR + LF.
             self.ser.write(
                 (cmd + "\r\n").encode()
             )
+
+            return True
 
         except (
             serial.SerialException,
@@ -480,6 +544,8 @@ class MainWindow(QWidget):
         ):
 
             self.connection_lost()
+
+            return False
 
         except Exception as e:
 
@@ -490,13 +556,20 @@ class MainWindow(QWidget):
 
             self.connection_lost()
 
+            return False
+
     # =========================================================
-    # GET
+    # GET NORMAL
     # =========================================================
 
     def send_get(self):
 
         if not self.connected:
+            return
+
+        # Durante la restauración el GET es controlado
+        # por la máquina de restauración.
+        if self.restoring:
             return
 
         self.send_command(
@@ -512,15 +585,392 @@ class MainWindow(QWidget):
         if not self.connected:
             return
 
+        print(
+            f"RX: {text}"
+        )
+
         self.status_label.setText(
             text
         )
 
+        # -----------------------------------------------------
+        # Solo procesamos mensajes ESTADO:
+        # -----------------------------------------------------
+
+        if not text.upper().startswith("ESTADO:"):
+            return
+
+        texto = text.upper()
+
+        # -----------------------------------------------------
+        # ÁCIDO
+        # -----------------------------------------------------
+
+        if "ÁCIDO ON" in texto:
+
+            self.acido_state = True
+
+        elif "ÁCIDO OFF" in texto:
+
+            self.acido_state = False
+
+        # -----------------------------------------------------
+        # BASE
+        # -----------------------------------------------------
+
+        if "BASE ON" in texto:
+
+            self.base_state = True
+
+        elif "BASE OFF" in texto:
+
+            self.base_state = False
+
+        # -----------------------------------------------------
+        # Mostrar estado guardado
+        # -----------------------------------------------------
+
+        print(
+            "Estado confirmado y guardado:"
+        )
+
+        self.print_saved_state()
+
+        # -----------------------------------------------------
+        # Si estamos restaurando, esta respuesta confirma
+        # que Arduino recibió/procesó los comandos.
+        # -----------------------------------------------------
+
+        if self.restoring:
+
+            print(
+                "Estado recibido durante la "
+                "restauración."
+            )
+
+            self.restore_timeout_timer.stop()
+
+            self.finish_restore()
+
     # =========================================================
-    # HABILITAR / DESHABILITAR BOTONES
+    # MOSTRAR ESTADO GUARDADO
+    # =========================================================
+
+    def print_saved_state(self):
+
+        if self.acido_state is True:
+
+            acido = "ON"
+
+        elif self.acido_state is False:
+
+            acido = "OFF"
+
+        else:
+
+            acido = "DESCONOCIDO"
+
+        if self.base_state is True:
+
+            base = "ON"
+
+        elif self.base_state is False:
+
+            base = "OFF"
+
+        else:
+
+            base = "DESCONOCIDO"
+
+        print(
+            f"  ACIDO = {acido}"
+        )
+
+        print(
+            f"  BASE  = {base}"
+        )
+
+    # =========================================================
+    # INICIAR RESTAURACIÓN
+    # =========================================================
+
+    def start_restore(self):
+
+        if not self.connected:
+            return
+
+        self.restoring = True
+
+        self.restore_steps = []
+        self.restore_index = 0
+
+        # -----------------------------------------------------
+        # No tenemos un estado completo guardado.
+        #
+        # En este caso NO mandamos APAGAR.
+        # Simplemente preguntamos al Arduino.
+        # -----------------------------------------------------
+
+        if (
+            self.acido_state is None
+            or self.base_state is None
+        ):
+
+            print()
+            print(
+                "No hay estado guardado completo."
+            )
+
+            print(
+                "Consultando estado actual..."
+            )
+
+            self.restore_steps = [
+                "GET"
+            ]
+
+        else:
+
+            print()
+            print(
+                "================================"
+            )
+
+            print(
+                "RESTAURANDO ESTADO GUARDADO"
+            )
+
+            print(
+                "================================"
+            )
+
+            self.print_saved_state()
+
+            print()
+
+            # -------------------------------------------------
+            # Primero apagamos ambos canales.
+            # -------------------------------------------------
+
+            self.restore_steps.append(
+                "APAGAR"
+            )
+
+            # -------------------------------------------------
+            # Recuperar ACIDO si estaba ON.
+            # -------------------------------------------------
+
+            if self.acido_state:
+
+                self.restore_steps.append(
+                    "ACIDO"
+                )
+
+            # -------------------------------------------------
+            # Recuperar BASE si estaba ON.
+            # -------------------------------------------------
+
+            if self.base_state:
+
+                self.restore_steps.append(
+                    "BASE"
+                )
+
+            # -------------------------------------------------
+            # Verificación final.
+            # -------------------------------------------------
+
+            self.restore_steps.append(
+                "GET"
+            )
+
+        self.restore_next_step()
+
+    # =========================================================
+    # SIGUIENTE PASO DE RESTAURACIÓN
+    # =========================================================
+
+    def restore_next_step(self):
+
+        if not self.restoring:
+            return
+
+        if not self.connected:
+
+            self.cancel_restore()
+
+            return
+
+        # -----------------------------------------------------
+        # ¿Terminamos todos los comandos?
+        # -----------------------------------------------------
+
+        if self.restore_index >= len(
+            self.restore_steps
+        ):
+
+            self.finish_restore()
+
+            return
+
+        # -----------------------------------------------------
+        # Siguiente comando
+        # -----------------------------------------------------
+
+        cmd = self.restore_steps[
+            self.restore_index
+        ]
+
+        self.restore_index += 1
+
+        print(
+            f"RESTORE -> {cmd}"
+        )
+
+        # -----------------------------------------------------
+        # Enviar
+        # -----------------------------------------------------
+
+        if not self.send_command(cmd):
+
+            self.cancel_restore()
+
+            return
+
+        # -----------------------------------------------------
+        # GET:
+        #
+        # Esperamos una respuesta ESTADO.
+        # No avanzamos hasta recibirla.
+        # -----------------------------------------------------
+
+        if cmd == "GET":
+
+            self.restore_timeout_timer.start(
+                RESTORE_RESPONSE_TIMEOUT
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # APAGAR / ACIDO / BASE:
+        #
+        # Esperamos antes del siguiente comando.
+        # -----------------------------------------------------
+
+        self.restore_timer.start(
+            RESTORE_STEP_DELAY
+        )
+
+    # =========================================================
+    # TIMEOUT DE RESTAURACIÓN
+    # =========================================================
+
+    def restore_timeout(self):
+
+        if not self.restoring:
+            return
+
+        if not self.connected:
+            return
+
+        print()
+        print(
+            "TIMEOUT esperando respuesta "
+            "ESTADO."
+        )
+
+        print(
+            "Reintentando GET..."
+        )
+
+        # -----------------------------------------------------
+        # No acumulamos comandos.
+        # Simplemente volvemos a consultar.
+        # -----------------------------------------------------
+
+        self.restore_steps = [
+            "GET"
+        ]
+
+        self.restore_index = 0
+
+        self.restore_next_step()
+
+    # =========================================================
+    # TERMINAR RESTAURACIÓN
+    # =========================================================
+
+    def finish_restore(self):
+
+        if not self.restoring:
+            return
+
+        self.restoring = False
+
+        self.restore_timer.stop()
+        self.restore_timeout_timer.stop()
+
+        print()
+        print(
+            "================================"
+        )
+
+        print(
+            "RESTAURACIÓN COMPLETADA"
+        )
+
+        print(
+            "================================"
+        )
+
+        print(
+            "Estado confirmado:"
+        )
+
+        self.print_saved_state()
+
+        print(
+            "================================"
+        )
+
+        print()
+
+        # -----------------------------------------------------
+        # Volver al funcionamiento normal.
+        # -----------------------------------------------------
+
+        self.set_buttons_enabled(True)
+
+        self.get_timer.start(
+            GET_INTERVAL
+        )
+
+    # =========================================================
+    # CANCELAR RESTAURACIÓN
+    # =========================================================
+
+    def cancel_restore(self):
+
+        self.restoring = False
+
+        self.connect_timer.stop()
+        self.restore_timer.stop()
+        self.restore_timeout_timer.stop()
+
+        self.restore_steps = []
+        self.restore_index = 0
+
+    # =========================================================
+    # BOTONES
     # =========================================================
 
     def set_buttons_enabled(self, enabled):
+
+        # Nunca habilitar durante restauración.
+        if self.restoring:
+
+            enabled = False
 
         self.btn1.setEnabled(
             enabled
@@ -535,7 +985,7 @@ class MainWindow(QWidget):
         )
 
     # =========================================================
-    # CERRAR PROGRAMA
+    # CIERRE
     # =========================================================
 
     def closeEvent(self, event):
@@ -554,6 +1004,12 @@ class MainWindow(QWidget):
 
         self.reconnect_timer.stop()
 
+        self.connect_timer.stop()
+
+        self.restore_timer.stop()
+
+        self.restore_timeout_timer.stop()
+
         # -----------------------------------------------------
         # Deshabilitar botones
         # -----------------------------------------------------
@@ -563,7 +1019,7 @@ class MainWindow(QWidget):
         )
 
         # -----------------------------------------------------
-        # Desconectar serial
+        # Desconectar
         # -----------------------------------------------------
 
         self.disconnect_serial()
