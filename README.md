@@ -8,6 +8,8 @@ de las 2 permanece encendida.
 La comunicación es por puerto serie, con una velocidad de 9600, 8N1.
 El firmware asociado a este control remoto se ubica dentro de este repositorio para mayor practicidad.
 
+![Ventana principal](capturas/pantalla.png)
+
 ## Tabla de Contenidos
 
 - [Instalación](#instalación)
@@ -40,8 +42,6 @@ Tener instalados los siguientes programas:
 
 Los archivos que debe modificar el usuario son los siguientes:
 - config.txt: define el puerto serie (Velocidad y puerto) donde está conectado el control.
-
-![Ventana principal](capturas/pantalla.png)
 
 ### 1. Seteo de puerto y velocidad
 Dentro del archivo **config.txt**, modificar el valor de la variable **PORT** al puerto que corresponda. **COMX** en windows, **/dev/ttyX** en linux, donde **X** lo otorga el sistema. La velocidad está fija, pero por si alguna razón cambia el firmware, modificar **BAUD** al valor que corresponda.
