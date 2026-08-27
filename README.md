@@ -41,6 +41,8 @@ Tener instalados los siguientes programas:
 Los archivos que debe modificar el usuario son los siguientes:
 - config.txt: define el puerto serie (Velocidad y puerto) donde está conectado el control.
 
+![Ventana principal](capturas/pantalla.png)
+
 ### 1. Seteo de puerto y velocidad
 Dentro del archivo **config.txt**, modificar el valor de la variable **PORT** al puerto que corresponda. **COMX** en windows, **/dev/ttyX** en linux, donde **X** lo otorga el sistema. La velocidad está fija, pero por si alguna razón cambia el firmware, modificar **BAUD** al valor que corresponda.
 
